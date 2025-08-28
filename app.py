@@ -1,4 +1,4 @@
-# app.py – ERA5 interactive maps for hourly data with colour-bar sliders
+# app.py – ERA5 interactive maps for hourly data with animation
 import xarray as xr
 import streamlit as st
 import plotly.express as px
@@ -60,7 +60,19 @@ selected_date = st.sidebar.date_input(
     max_value=datetime.date.today(),
 )
 
-selected_hour = st.sidebar.selectbox("Hour (UTC)", list(range(24)))
+# MODIFIED: Added animation checkbox and conditional hour selector
+st.sidebar.markdown("### View Options")
+is_animated = st.sidebar.checkbox("Animate Time Series")
+
+if is_animated:
+    if field_type == "Surface":
+        st.sidebar.info(f"Animating full month: {selected_date.strftime('%B %Y')}")
+    else:
+        st.sidebar.info(f"Animating full day: {selected_date.strftime('%Y-%m-%d')}")
+    selected_hour = 0 # Default hour, not used for slicing
+else:
+    selected_hour = st.sidebar.selectbox("Hour (UTC)", list(range(24)))
+
 show_coast = st.sidebar.checkbox("Show coastlines", value=True)
 
 
@@ -71,13 +83,11 @@ def rda_url(dom, code, var, date):
     year, month, day = date.year, date.month, date.day
 
     if dom == "sfc":
-        # Monthly files for surface data
         _, last_day = calendar.monthrange(year, month)
         folder = f"e5.oper.an.sfc/{year}{month:02d}/"
         filename = (f"e5.oper.an.sfc.128_{code}_{var}.ll025sc."
                     f"{year}{month:02d}0100_{year}{month:02d}{last_day}23.nc")
     else:  # dom == "pl"
-        # Daily files for pressure level data
         extra = "uv" if var in {"u", "v"} else "sc"
         folder = f"e5.oper.an.pl/{year}{month:02d}/"
         filename = (f"e5.oper.an.pl.128_{code}_{var}.ll025{extra}."
@@ -116,34 +126,30 @@ def coastlines_trace(res="110m", gap=10):
                       hoverinfo="skip", showlegend=False)
 
 # ─────────── load hourly field ──────────────────────────────────────────
-target_datetime = datetime.datetime(
-    selected_date.year, selected_date.month, selected_date.day, selected_hour
-)
-
 try:
+    # Load the single file containing either the full day or full month
     url = rda_url(domain, code, vname, selected_date)
     ds = open_dataset_from_url(url)
-    da = ds[find_var(ds, vname)].sel(time=target_datetime, method="nearest")
+    da = ds[find_var(ds, vname)] # Start with the full data array
+
+    # Apply level selection and unit conversions to the whole dataset
     if plevel is not None:
         da = da.sel(level=plevel)
 
-    # Unit conversions
     if vname in {"sstk", "2t", "t"}: da, units = da - 273.15, "°C"
     if vname in {"sp", "msl"}:       da, units = da / 100.0, "hPa"
 
+    # MODIFIED: If not animating, slice the data down to a single hour
+    if not is_animated:
+        target_datetime = datetime.datetime.combine(selected_date, datetime.time(selected_hour))
+        da = da.sel(time=target_datetime, method="nearest")
+
 except Exception as e:
     st.error(f"""
-    **Failed to load data.** This could be due to a few reasons:
-    - The remote data server might be temporarily down.
-    - The requested date/variable combination might not be available.
-    - There might be a network issue.
-
-    Please try a different date or variable.
-
+    **Failed to load data.** This could be due to a few reasons...
     **Error details:** `{e}`
     """)
     st.stop()
-
 
 # ─────────── colour-bar controls ──────────────────────────────────────────
 data_min = float(np.nanmin(da))
@@ -151,11 +157,10 @@ data_max = float(np.nanmax(da))
 default_min, default_max = data_min, data_max
 
 st.sidebar.markdown("### Colour-bar limits")
-step = (default_max - default_min) / 50 or 1e-6  # avoid step=0
+step = (default_max - default_min) / 50 or 1e-6
 cmin = st.sidebar.slider("Min", data_min, data_max, value=default_min, step=step, format="%.4g")
 cmax = st.sidebar.slider("Max", data_min, data_max, value=default_max, step=step, format="%.4g")
 
-# Auto-scale button (98 % central quantile)
 if st.sidebar.button("Auto-scale (98 % of data)"):
     qmin, qmax = np.nanquantile(da, [0.01, 0.99])
     cmin, cmax = float(qmin), float(qmax)
@@ -164,18 +169,37 @@ if cmin >= cmax:
     st.sidebar.error("Min must be less than Max")
     st.stop()
 
-# ─────────── plot ──────────────────────────────────────────────────────
-title_date = f"{selected_date.strftime('%Y-%m-%d')} {selected_hour:02d}:00 UTC"
-title = f"{choice} • {title_date}" + (f" • {plevel} hPa" if plevel else "")
+# ─────────── plot ────────────────────────────────────────────────────────
+# MODIFIED: Conditional plotting for static image vs. animation
+if is_animated:
+    if domain == 'sfc':
+        date_str = selected_date.strftime('%B %Y')
+    else:
+        date_str = selected_date.strftime('%Y-%m-%d')
+    
+    title = f"{choice} • {date_str}" + (f" • {plevel} hPa" if plevel else "")
+    
+    fig = px.imshow(
+        da,
+        origin="lower", aspect="auto",
+        color_continuous_scale=cmap,
+        labels=dict(color=units),
+        title=title,
+        animation_frame="time"  # This creates the animation
+    )
+    fig.update_layout(sliders=[dict(currentvalue={"prefix": "Time: "})])
 
-fig = px.imshow(
-    da,
-    origin="lower",
-    aspect="auto",
-    color_continuous_scale=cmap,
-    labels=dict(color=units),
-    title=title,
-)
+else: # This is the original plotting logic
+    title_date = f"{selected_date.strftime('%Y-%m-%d')} {selected_hour:02d}:00 UTC"
+    title = f"{choice} • {title_date}" + (f" • {plevel} hPa" if plevel else "")
+    fig = px.imshow(
+        da,
+        origin="lower", aspect="auto",
+        color_continuous_scale=cmap,
+        labels=dict(color=units),
+        title=title,
+    )
+
 fig.update_coloraxes(cmin=cmin, cmax=cmax)
 fig.update_layout(margin=dict(l=0, r=0, t=40, b=0), uirevision="keep")
 
@@ -183,8 +207,7 @@ if show_coast:
     fig.add_trace(coastlines_trace())
 
 st.plotly_chart(fig, use_container_width=True)
-
-st.caption("Plot created reading ERA5 from NCAR's RDA. Code by [Jose A. Ocegueda Sanchez](https://Langosmon.github.io).")
+st.caption("Plot created reading RDA's ERA5. Code by [Jose A. Ocegueda Sanchez](https://Langosmon.github.io).")
 
 
 
