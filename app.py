@@ -63,17 +63,25 @@ selected_date = st.sidebar.date_input(
 animate = st.sidebar.checkbox(
     "Animate over time",
     value=False,
-    help=(
-        "If checked, the map animates over all available hours in the opened file "
-        "(entire month for surface, the day for pressure-level files)."
-    ),
+    help=("If checked, animate hours from the opened file "
+          "(entire month for surface, the day for pressure-level files)."),
 )
 
-if not animate:
-    selected_hour = st.sidebar.selectbox("Hour (UTC)", list(range(24)))
-else:
+if animate:
+    day_only = st.sidebar.checkbox(
+        "Animate only selected day (recommended)",
+        value=True,
+        help="Greatly reduces remote reads (24 frames instead of up to ~744)."
+    )
+    step_hours = st.sidebar.number_input(
+        "Sample every N hours",
+        min_value=1, max_value=24, value=1, step=1,
+        help="Use 3/6 to throttle requests and speed up."
+    )
     selected_hour = None
     st.sidebar.caption("Animation is ON → hour selector hidden.")
+else:
+    selected_hour = st.sidebar.selectbox("Hour (UTC)", list(range(24)))
 
 show_coast = st.sidebar.checkbox("Show coastlines", value=True)
 
@@ -135,7 +143,7 @@ def coastlines_trace(res="110m", gap=10):
         hoverinfo="skip", showlegend=False
     )
 
-# ─────────── load data (full file) ───────────────────────────────────────
+# ─────────── load data (single file; pull needed hours once) ─────────────
 target_datetime = None
 if not animate:
     target_datetime = datetime.datetime(
@@ -151,7 +159,7 @@ try:
     if plevel is not None:
         da_all = da_all.sel(level=plevel)
 
-    # Unit conversions on the full array to keep colorbar consistent across frames
+    # Unit conversions (lazy until .load())
     if vname in {"sstk", "2t", "t"}:
         da_all = da_all - 273.15
         units = "°C"
@@ -159,31 +167,32 @@ try:
         da_all = da_all / 100.0
         units = "hPa"
 
-    # For single-frame mode, select the requested time
-    if not animate:
-        da = da_all.sel(time=target_datetime, method="nearest")
+    if animate:
+        if day_only:
+            start = datetime.datetime(selected_date.year, selected_date.month, selected_date.day, 0)
+            end   = start + datetime.timedelta(hours=23)
+            da_anim = da_all.sel(time=slice(start, end)).isel(time=slice(None, None, step_hours)).load()
+        else:
+            # entire file (month for surface, day for pressure levels)
+            da_anim = da_all.isel(time=slice(None, None, step_hours)).load()
+    else:
+        da = da_all.sel(time=target_datetime, method="nearest").load()
 
 except Exception as e:
     st.error(f"""
-    **Failed to load data.** This could be due to a few reasons:
-    - The remote data server might be temporarily down.
-    - The requested date/variable combination might not be available.
-    - There might be a network issue.
+    **Failed to load data.** Possible causes:
+    - Remote server rate-limited or temporarily denied access (many small OPeNDAP reads).
+    - Date/variable unavailable or network hiccup.
 
-    Please try a different date or variable.
-
+    Try 'Animate only selected day' and/or larger 'Sample every N hours'.
     **Error details:** `{e}`
     """)
     st.stop()
 
 # ─────────── colour-bar controls ─────────────────────────────────────────
-if animate:
-    arr_for_limits = da_all
-else:
-    arr_for_limits = da
-
-data_min = float(np.nanmin(arr_for_limits))
-data_max = float(np.nanmax(arr_for_limits))
+arr_for_limits = da_anim if animate else da
+data_min = float(np.nanmin(arr_for_limits.values))
+data_max = float(np.nanmax(arr_for_limits.values))
 default_min, default_max = data_min, data_max
 
 st.sidebar.markdown("### Colour-bar limits")
@@ -193,7 +202,7 @@ cmax = st.sidebar.slider("Max", data_min, data_max, value=default_max, step=step
 
 # Auto-scale button (98 % central quantile)
 if st.sidebar.button("Auto-scale (98 % of data)"):
-    qmin, qmax = np.nanquantile(arr_for_limits, [0.01, 0.99])
+    qmin, qmax = np.nanquantile(arr_for_limits.values, [0.01, 0.99])
     cmin, cmax = float(qmin), float(qmax)
 
 if cmin >= cmax:
@@ -201,14 +210,6 @@ if cmin >= cmax:
     st.stop()
 
 # ─────────── plot (single image OR animation) ────────────────────────────
-lon = da_all.coords.get("longitude", None)
-lat = da_all.coords.get("latitude", None)
-if lon is None or lat is None:
-    st.error("Dataset missing latitude/longitude coordinates.")
-    st.stop()
-lon = np.asarray(lon.values)
-lat = np.asarray(lat.values)
-
 if not animate:
     title_date = f"{selected_date.strftime('%Y-%m-%d')} {selected_hour:02d}:00 UTC"
     title = f"{choice} • {title_date}" + (f" • {plevel} hPa" if plevel else "")
@@ -223,58 +224,64 @@ if not animate:
     )
     fig.update_coloraxes(cmin=cmin, cmax=cmax)
     fig.update_layout(margin=dict(l=0, r=0, t=40, b=0), uirevision="keep")
-
     if show_coast:
         fig.add_trace(coastlines_trace())
 
     st.plotly_chart(fig, use_container_width=True)
 
 else:
-    # Build frames over all available times in the opened file
-    times = np.asarray(da_all["time"].values)
-    # Optional safety: warn if this will be very large
-    if times.size > 500:
-        st.warning(
-            f"Animating {times.size} frames from the opened file. "
-            "This may be heavy in the browser."
-        )
+    # Build frames from the in-memory subset
+    if "longitude" not in da_anim.coords or "latitude" not in da_anim.coords:
+        st.error("Dataset missing latitude/longitude coordinates.")
+        st.stop()
 
-    # Initial frame (first time)
-    z0 = np.asarray(da_all.isel(time=0).values)
+    lon = np.asarray(da_anim.coords["longitude"].values)
+    lat = np.asarray(da_anim.coords["latitude"].values)
+    times = np.asarray(da_anim["time"].values)
+
+    # Determine if latitude is descending (ERA5 usually is)
+    lat_desc = bool(lat[0] > lat[-1])
+
+    # Initial frame
+    z0 = np.asarray(da_anim.isel(time=0).values)
     heat0 = go.Heatmap(
-        z=z0, x=lon, y=lat,
-        colorscale=cmap, zmin=cmin, zmax=cmax,
-        colorbar=dict(title=units),
-        hoverinfo="skip"
+        z=z0, x=lon, y=lat, colorscale=cmap, zmin=cmin, zmax=cmax,
+        colorbar=dict(title=units), hoverinfo="skip"
     )
     frames = []
     labels = []
     for i, t in enumerate(times):
-        zt = np.asarray(da_all.isel(time=i).values)
-        # Minimal frame payload: update the first (heatmap) trace's z
+        zt = np.asarray(da_anim.isel(time=i).values)
         frames.append(go.Frame(
             data=[dict(type="heatmap", z=zt)],
             name=str(np.datetime_as_string(t, unit="h"))
         ))
         labels.append(np.datetime_as_string(t, unit="h").replace("T", " "))
 
-    # Figure with frames
+    title_bits = [choice]
+    if plevel is not None:
+        title_bits.append(f"{plevel} hPa")
+    if day_only:
+        title_bits.append(selected_date.strftime("%Y-%m-%d"))
+    else:
+        # show file span
+        t0 = np.datetime_as_string(times[0], unit="h").replace("T"," ")
+        t1 = np.datetime_as_string(times[-1], unit="h").replace("T"," ")
+        title_bits.append(f"{t0} → {t1}")
+
     fig = go.Figure(data=[heat0], frames=frames)
-    # Coastlines overlay (static)
     if show_coast:
         fig.add_trace(coastlines_trace())
 
-    # Layout, axis orientation (lat usually descending in ERA5)
     fig.update_layout(
-        title=f"{choice}" + (f" • {plevel} hPa" if plevel else "") + " • Animation",
+        title=" • ".join(title_bits) + " • Animation",
         margin=dict(l=0, r=0, t=50, b=0),
         xaxis_title="Longitude",
         yaxis_title="Latitude",
-        yaxis=dict(autorange="reversed"),
+        yaxis=dict(autorange="reversed" if lat_desc else True),
     )
 
-    # Animation controls (play/pause + time slider)
-    frame_ms = 200  # change speed here (ms per frame)
+    frame_ms = 200  # speed (ms per frame)
     fig.update_layout(
         updatemenus=[dict(
             type="buttons",
@@ -315,6 +322,7 @@ else:
     st.plotly_chart(fig, use_container_width=True)
 
 st.caption("Plot created reading ERA5 from NCAR's RDA. Code by [Jose A. Ocegueda Sanchez](https://Langosmon.github.io).")
+
 
 
 
