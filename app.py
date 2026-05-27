@@ -68,10 +68,13 @@ target_dt = datetime.datetime(selected_date.year, selected_date.month,
                               selected_date.day, selected_hour)
 
 try:
-    ds = C.open_dataset_cached(rda_url(domain, code, vname, selected_date))
-    da = ds[C.find_var(ds, vname)].sel(time=target_dt, method="nearest")
-    if plevel is not None:
-        da = da.sel(level=plevel)
+    # Eagerly load the whole file (monthly chunk for sfc, daily for pl) for
+    # this (var, plevel). Switching hours within the same loaded chunk is
+    # then instant.
+    full_chunk = C.load_field_cached(
+        rda_url(domain, code, vname, selected_date), vname, plevel,
+    )
+    da = full_chunk.sel(time=target_dt, method="nearest")
 except Exception as e:
     st.error(
         "**Failed to load remote ERA5 data.**  "
