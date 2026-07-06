@@ -50,6 +50,12 @@ selected_hour = col_h.selectbox("Hour", list(range(24)), index=6)  # Otis landfa
 st.sidebar.caption("ERA5 publishes with ~5 days of latency.")
 
 st.sidebar.header("Display")
+animate = st.sidebar.toggle("▶ Day animation (24 h)", value=False,
+                            help="Loads all 24 hours of the selected day at "
+                                 "0.5° resolution and plays them in your "
+                                 "browser — play/pause and an hour slider "
+                                 "appear under the map. First load of a day "
+                                 "transfers ~25 MB from RDA, then it's cached.")
 show_anom  = st.sidebar.toggle("Anomaly (value − monthly climatology)", value=False,
                                help="Departure from the 1980–2010 mean of the "
                                     "selected month. Because the reference is a "
@@ -86,12 +92,20 @@ target_dt = datetime.datetime(selected_date.year, selected_date.month,
                               selected_date.day, selected_hour)
 
 try:
-    # time_sel slices server-side BEFORE download: one ~4 MB hour instead of
-    # a whole month of hourly fields (~3 GB for surface files).
-    da = C.load_field_cached(
-        rda_url(domain, code, vname, selected_date), vname, plevel,
-        time_sel=target_dt.isoformat(),
-    )
+    if animate:
+        # All 24 hours of the day at 0.5° (stride 2) — OPeNDAP subsets
+        # server-side, so this transfers ~25 MB instead of ~100 MB.
+        da = C.load_field_cached(
+            rda_url(domain, code, vname, selected_date), vname, plevel,
+            day_sel=selected_date.isoformat(), stride=2,
+        )
+    else:
+        # time_sel slices server-side BEFORE download: one ~4 MB hour instead
+        # of a whole month of hourly fields (~3 GB for surface files).
+        da = C.load_field_cached(
+            rda_url(domain, code, vname, selected_date), vname, plevel,
+            time_sel=target_dt.isoformat(),
+        )
 except Exception as e:
     st.error(
         "**Failed to load remote ERA5 data.**  "
@@ -168,40 +182,61 @@ cmin, cmax = C.colourbar_controls(da, show_anom,
 
 
 # ─── figure ──────────────────────────────────────────────────────────────────
-title = f"{choice} · {selected_date.strftime('%Y-%m-%d')} {selected_hour:02d}:00 UTC"
+title = f"{choice} · {selected_date.strftime('%Y-%m-%d')}"
+if not animate: title += f" {selected_hour:02d}:00 UTC"
 if plevel is not None: title += f" · {plevel} hPa"
 if show_anom: title += " · anomaly"
 if mask_mode != "All": title += f" · {mask_mode.lower()} only"
 
-fig = C.build_figure(da, title, units, cmap, cmin, cmax, show_coast, height=580)
+if animate:
+    fig = C.build_animation_figure(da, title + " · 24 h", units, cmap,
+                                   cmin, cmax, show_coast, height=580)
+    st.plotly_chart(
+        fig, use_container_width=True, key="anim_plot",
+        config={"displaylogo": False,
+                "modeBarButtonsToRemove": ["lasso2d", "select2d"]},
+    )
+    st.caption(
+        "▶ Press play (bottom left) or drag the hour slider. Frames are "
+        "0.5° and colour-mapped server-side, so hover values are off in "
+        "animation mode — switch the toggle off to inspect exact values. "
+        "Region presets still tune the colour-bar."
+    )
+else:
+    fig = C.build_figure(da, title, units, cmap, cmin, cmax, show_coast, height=580)
 
-st.plotly_chart(
-    fig, use_container_width=True,
-    on_select="rerun", selection_mode=("box",),
-    key="main_plot",
-    config={"displaylogo": False,
-            "modeBarButtonsToRemove": ["lasso2d"]},
-)
+    st.plotly_chart(
+        fig, use_container_width=True,
+        on_select="rerun", selection_mode=("box",),
+        key="main_plot",
+        config={"displaylogo": False,
+                "modeBarButtonsToRemove": ["lasso2d"]},
+    )
 
 if show_anom:
     st.caption(
-        "⚠️ Anomaly = this hour minus the **monthly-mean** climatology, so the "
+        "⚠️ Anomaly = value minus the **monthly-mean** climatology, so the "
         "diurnal cycle is still in the signal (strongest for 2-m temperature "
         "over land). Compare the same hour across days/years for a cleaner read."
     )
 
-col_t, col_r = st.columns([4, 1])
-with col_t:
-    st.caption(
-        "💡 **Box-select tool** in the Plotly toolbar → draw a region → "
-        "colour-bar rescales to the 98% quantile of that box. Useful when "
-        "topography or coastal extremes dominate the global range."
-    )
-with col_r:
-    if last_box is not None and st.button("Reset region", use_container_width=True):
-        st.session_state["_dismissed_box"] = last_box
-        st.session_state["_last_box"] = None
-        st.rerun()
+if not animate:
+    col_t, col_r = st.columns([4, 1])
+    with col_t:
+        st.caption(
+            "💡 **Box-select tool** in the Plotly toolbar → draw a region → "
+            "colour-bar rescales to the 98% quantile of that box. Useful when "
+            "topography or coastal extremes dominate the global range."
+        )
+    with col_r:
+        if last_box is not None and st.button("Reset region", use_container_width=True):
+            st.session_state["_dismissed_box"] = last_box
+            st.session_state["_last_box"] = None
+            st.rerun()
+elif last_box is not None and st.button("Reset region", use_container_width=False):
+    st.session_state["_dismissed_box"] = last_box
+    st.session_state["_last_box"] = None
+    st.rerun()
 
 
 with st.expander("Quick picks — notable storms / events", expanded=False):
