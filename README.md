@@ -9,7 +9,7 @@ Live: https://era5hourlyapp-alfredocegueda.streamlit.app/
 ## Features
 
 - 8 surface fields + 11 pressure-level fields, 8 standard pressure levels
-- Hourly resolution, **1940 – today**
+- Hourly resolution, **1940 – about six days ago (ERA5 latency)**
 - Quick-pick presets for notable storms (Otis, Patricia, Sandy, Irma)
 - **Anomaly** toggle: departure from the monthly climatology of the selected
   month (climatology hosted on `ERA5_streamlit` GitHub Releases — fetched on

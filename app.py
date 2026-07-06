@@ -112,7 +112,7 @@ if show_anom:
         clim_month = clim.sel(month=selected_date.month)
         da = da - clim_month          # native − native: units match
         cmap = cmap_anom
-    except FileNotFoundError as e:
+    except Exception as e:
         st.warning(f"Climatology unavailable for this field — showing absolute value instead.\n\n{e}")
         show_anom = False
         cmap = cmap_abs
