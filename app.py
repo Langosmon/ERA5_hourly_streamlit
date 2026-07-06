@@ -3,6 +3,14 @@
 Anomalies are computed against the monthly climatology of the date's month
 (same climatology files as the monthly app, fetched from the GitHub Release
 on the ERA5_streamlit repo).
+
+Unit contract: fields and climatology are differenced in ERA5 NATIVE units;
+apply_unit_conversions() runs AFTER the anomaly step (see _common docstring).
+
+Note on statistics: this app deliberately has NO significance overlay. The
+available σ is the year-to-year spread of MONTHLY means — the wrong noise
+floor for an hourly snapshot (hourly synoptic + diurnal variability is far
+larger), so a stipple here would mark nearly everything "significant".
 """
 
 import calendar
@@ -17,11 +25,14 @@ import _common as C
 # ─── page setup ───────────────────────────────────────────────────────────────
 C.configure_page(
     title="ERA5 · Hourly Maps",
-    subtitle="Pick a date and hour (1940 – today). Surface fields and pressure levels.",
+    subtitle="Pick a date and hour (1940 – near-present). Surface fields and pressure levels.",
     icon="🕒",
 )
 
 REPO_URL = "https://github.com/Langosmon/ERA5_hourly_streamlit"
+
+# ERA5 has ~5-day latency; leave headroom so the default range always exists.
+LATEST_DAY = datetime.date.today() - datetime.timedelta(days=6)
 
 
 # ─── sidebar controls ────────────────────────────────────────────────────────
@@ -33,18 +44,18 @@ selected_date = col_d.date_input(
     "Date (UTC)",
     value=datetime.date(2023, 10, 25),  # Hurricane Otis landfall
     min_value=datetime.date(1940, 1, 1),
-    max_value=datetime.date.today(),
+    max_value=LATEST_DAY,
 )
-selected_hour = col_h.selectbox("Hour", list(range(24)), index=12)
+selected_hour = col_h.selectbox("Hour", list(range(24)), index=6)  # Otis landfall ≈ 06:25 UTC
+st.sidebar.caption("ERA5 publishes with ~5 days of latency.")
 
 st.sidebar.header("Display")
 show_anom  = st.sidebar.toggle("Anomaly (value − monthly climatology)", value=False,
-                               help="Anomaly is computed against the climatology "
-                                    "mean for the selected month (1980–2010).")
-show_sig   = st.sidebar.toggle("Mark statistically significant", value=False,
-                               disabled=not show_anom,
-                               help="Stipples points where |anomaly| ≥ 1.96·σ. "
-                                    "Requires std-dev climatology.")
+                               help="Departure from the 1980–2010 mean of the "
+                                    "selected month. Because the reference is a "
+                                    "monthly mean, hourly anomalies still contain "
+                                    "the diurnal cycle — largest for 2-m "
+                                    "temperature over land (±10 K or more).")
 show_coast = st.sidebar.toggle("Coastlines", value=True)
 
 mask_mode = st.sidebar.radio(
@@ -75,72 +86,70 @@ target_dt = datetime.datetime(selected_date.year, selected_date.month,
                               selected_date.day, selected_hour)
 
 try:
-    full_chunk = C.load_field_cached(
+    # time_sel slices server-side BEFORE download: one ~4 MB hour instead of
+    # a whole month of hourly fields (~3 GB for surface files).
+    da = C.load_field_cached(
         rda_url(domain, code, vname, selected_date), vname, plevel,
+        time_sel=target_dt.isoformat(),
     )
-    da = full_chunk.sel(time=target_dt, method="nearest")
 except Exception as e:
     st.error(
         "**Failed to load remote ERA5 data.**  "
         "The RDA server may be temporarily unreachable, or this "
         "date/variable/level combination may not exist."
     )
-    st.exception(e)
+    with st.expander("Technical details"):
+        st.exception(e)
     st.stop()
 
-da, units = C.apply_unit_conversions(da, vname, units)
 
-
-# ─── anomaly + significance ──────────────────────────────────────────────────
+# ─── anomaly (native units) ──────────────────────────────────────────────────
 cmap = cmap_abs
-clim_std = None
 
 if show_anom:
     try:
         clim = C.load_climatology(domain, vname, plevel)
         clim_month = clim.sel(month=selected_date.month)
-        da = da - clim_month
+        da = da - clim_month          # native − native: units match
         cmap = cmap_anom
-        units = (units or "") + " anomaly"
-
-        if show_sig:
-            if C.climatology_has_std(domain, vname, plevel):
-                std_full = C.load_climatology_std(domain, vname, plevel)
-                clim_std = std_full.sel(month=selected_date.month)
-            else:
-                st.info(
-                    "**Significance:** the current climatology file contains "
-                    "only the mean. Regenerate with std dev (see "
-                    "`tools/build_climatology.py` in the ERA5_streamlit repo) "
-                    "and reupload to the GitHub Release to enable this overlay."
-                )
-                show_sig = False
     except FileNotFoundError as e:
         st.warning(f"Climatology unavailable for this field — showing absolute value instead.\n\n{e}")
         show_anom = False
+        cmap = cmap_abs
+
+# Convert for display AFTER the subtraction (see module docstring).
+da, units = C.apply_unit_conversions(da, vname, units, anomaly=show_anom)
+if show_anom:
+    units = (units or "") + " anomaly"
 
 
 # ─── land / sea mask ─────────────────────────────────────────────────────────
 if mask_mode != "All":
     try:
         da = C.apply_lsm_mask(da, mask_mode)
-        if clim_std is not None:
-            clim_std = C.apply_lsm_mask(clim_std, mask_mode)
+        if bool(np.all(np.isnan(da.values))):
+            st.info(f"**Nothing to show:** {choice} has no data over "
+                    f"{mask_mode.lower()} (e.g. SST is ocean-only). "
+                    "Switch \"Show data on\" back to All or the other side.")
     except Exception as e:
         st.warning(f"Couldn't load land-sea mask — showing unmasked field.\n\n{e}")
 
 
-# ─── region picker + box-select autoscale ────────────────────────────────────
+# ─── region focus: preset picker + box-select ────────────────────────────────
 region_bbox, region_name = C.region_picker()
+
+# Read a freshly drawn box from the widget state BEFORE building the figure —
+# one rerun stores and applies it (no second st.rerun round-trip).
+state_box = C.box_selection_to_bounds(st.session_state.get("main_plot"))
+if state_box is not None and state_box != st.session_state.get("_dismissed_box"):
+    st.session_state["_last_box"] = state_box
+last_box = st.session_state.get("_last_box")
 
 override_default = None
 override_label = None
-last_box = st.session_state.get("_last_box")
 
 if last_box is not None:
     lat_min, lat_max, lon_min, lon_max = last_box
-    if da.longitude.max() > 180 and lon_min < 0:
-        lon_min, lon_max = (lon_min + 360) % 360, (lon_max + 360) % 360
     qlo, qhi = C.rescale_to_region(da, lat_min, lat_max, lon_min, lon_max,
                                    symmetric=show_anom)
     override_default = (qlo, qhi)
@@ -148,8 +157,6 @@ if last_box is not None:
                       f"{lon_min:.1f}–{lon_max:.1f}°E")
 elif region_bbox is not None:
     lat_min, lat_max, lon_min, lon_max = region_bbox
-    if da.longitude.max() > 180:
-        lon_min, lon_max = (lon_min + 360) % 360, (lon_max + 360) % 360
     qlo, qhi = C.rescale_to_region(da, lat_min, lat_max, lon_min, lon_max,
                                    symmetric=show_anom)
     override_default = (qlo, qhi)
@@ -168,10 +175,7 @@ if mask_mode != "All": title += f" · {mask_mode.lower()} only"
 
 fig = C.build_figure(da, title, units, cmap, cmin, cmax, show_coast, height=580)
 
-if show_anom and show_sig and clim_std is not None:
-    C.add_significance_stipple(fig, da, clim_std, z=1.96, stride=8)
-
-event = st.plotly_chart(
+st.plotly_chart(
     fig, use_container_width=True,
     on_select="rerun", selection_mode=("box",),
     key="main_plot",
@@ -179,10 +183,12 @@ event = st.plotly_chart(
             "modeBarButtonsToRemove": ["lasso2d"]},
 )
 
-new_box = C.box_selection_to_bounds(event)
-if new_box is not None and new_box != last_box:
-    st.session_state["_last_box"] = new_box
-    st.rerun()
+if show_anom:
+    st.caption(
+        "⚠️ Anomaly = this hour minus the **monthly-mean** climatology, so the "
+        "diurnal cycle is still in the signal (strongest for 2-m temperature "
+        "over land). Compare the same hour across days/years for a cleaner read."
+    )
 
 col_t, col_r = st.columns([4, 1])
 with col_t:
@@ -193,6 +199,7 @@ with col_t:
     )
 with col_r:
     if last_box is not None and st.button("Reset region", use_container_width=True):
+        st.session_state["_dismissed_box"] = last_box
         st.session_state["_last_box"] = None
         st.rerun()
 
@@ -202,7 +209,7 @@ with st.expander("Quick picks — notable storms / events", expanded=False):
     st.markdown(
         "- **2023-10-25 06 UTC** — Hurricane Otis at Cat 5 landfall, Acapulco\n"
         "- **2015-10-23 12 UTC** — Hurricane Patricia at peak intensity (185 kt)\n"
-        "- **2012-10-29 23 UTC** — Hurricane Sandy NJ landfall\n"
+        "- **2012-10-29 23 UTC** — Post-tropical Sandy NJ landfall\n"
         "- **2017-09-06 12 UTC** — Hurricane Irma in the Caribbean"
     )
 
